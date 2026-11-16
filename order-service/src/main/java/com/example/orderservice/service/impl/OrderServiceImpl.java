@@ -1,16 +1,16 @@
 package com.example.orderservice.service.impl;
 
-import com.example.orderservice.client.InventoryClient;
 import com.example.orderservice.dto.OrderRequest;
 import com.example.orderservice.dto.OrderResponse;
-import com.example.orderservice.dto.ProductDto;
 import com.example.orderservice.entity.Order;
+import com.example.orderservice.event.OrderPlacedEvent;
 import com.example.orderservice.repository.OrderRepository;
 import com.example.orderservice.service.OrderService;
-import feign.FeignException;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
+import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.server.ResponseStatusException;
@@ -20,17 +20,15 @@ import java.util.List;
 import java.util.stream.Collectors;
 
 @Service
+@RequiredArgsConstructor
+@Slf4j
 public class OrderServiceImpl implements OrderService {
 
-    private static final Logger log = LoggerFactory.getLogger(OrderServiceImpl.class);
-
     private final OrderRepository orderRepository;
-    private final InventoryClient inventoryClient;
+    private final KafkaTemplate<String, OrderPlacedEvent> orderKafkaTemplate;
 
-    public OrderServiceImpl(OrderRepository orderRepository, InventoryClient inventoryClient) {
-        this.orderRepository = orderRepository;
-        this.inventoryClient = inventoryClient;
-    }
+    @Value("${app.kafka.topics.order-events:order-events}")
+    private String orderEventsTopic;
 
     @Override
     @Transactional
@@ -39,114 +37,42 @@ public class OrderServiceImpl implements OrderService {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "ProductId and valid positive quantity are required");
         }
 
-        ProductDto product;
-        try {
-            log.info("Calling Inventory Service via OpenFeign for productId: {}", request.getProductId());
-            product = inventoryClient.getProductById(request.getProductId());
-        } catch (FeignException.NotFound e) {
-            log.warn("Product not found in Inventory Service: {}", request.getProductId());
-            Order cancelledOrder = Order.builder()
-                    .productId(request.getProductId())
-                    .quantity(request.getQuantity())
-                    .status("CANCELLED")
-                    .totalPrice(BigDecimal.ZERO)
-                    .build();
-            Order saved = orderRepository.save(cancelledOrder);
-            return OrderResponse.builder()
-                    .id(saved.getId())
-                    .productId(saved.getProductId())
-                    .quantity(saved.getQuantity())
-                    .status("CANCELLED")
-                    .totalPrice(BigDecimal.ZERO)
-                    .message("Product not found with id: " + request.getProductId())
-                    .build();
-        } catch (Exception e) {
-            log.error("Failed to communicate with Inventory Service: {}", e.getMessage());
-            Order cancelledOrder = Order.builder()
-                    .productId(request.getProductId())
-                    .quantity(request.getQuantity())
-                    .status("CANCELLED")
-                    .totalPrice(BigDecimal.ZERO)
-                    .build();
-            Order saved = orderRepository.save(cancelledOrder);
-            return OrderResponse.builder()
-                    .id(saved.getId())
-                    .productId(saved.getProductId())
-                    .quantity(saved.getQuantity())
-                    .status("CANCELLED")
-                    .totalPrice(BigDecimal.ZERO)
-                    .message("Unable to verify inventory: " + e.getMessage())
-                    .build();
-        }
-
-        // Kiem tra so luong ton kho
-        if (product.getQuantity() == null || product.getQuantity() < request.getQuantity()) {
-            log.warn("Insufficient stock for productId: {}. Available: {}, Requested: {}",
-                    request.getProductId(), product.getQuantity(), request.getQuantity());
-
-            Order cancelledOrder = Order.builder()
-                    .productId(request.getProductId())
-                    .quantity(request.getQuantity())
-                    .status("CANCELLED")
-                    .totalPrice(BigDecimal.ZERO)
-                    .build();
-            Order saved = orderRepository.save(cancelledOrder);
-
-            return OrderResponse.builder()
-                    .id(saved.getId())
-                    .productId(saved.getProductId())
-                    .quantity(saved.getQuantity())
-                    .status("CANCELLED")
-                    .totalPrice(BigDecimal.ZERO)
-                    .message(String.format("Insufficient stock. Available: %d, Requested: %d",
-                            product.getQuantity() != null ? product.getQuantity() : 0, request.getQuantity()))
-                    .build();
-        }
-
-        // Tinh tong tien = don gia * so luong
-        BigDecimal unitPrice = product.getPrice() != null ? product.getPrice() : BigDecimal.ZERO;
-        BigDecimal totalPrice = unitPrice.multiply(BigDecimal.valueOf(request.getQuantity()));
-
-        // Tru kho thong qua Inventory Service
-        try {
-            inventoryClient.deductStock(request.getProductId(), request.getQuantity());
-            log.info("Deducted {} items for productId: {} from inventory", request.getQuantity(), request.getProductId());
-        } catch (Exception e) {
-            log.error("Failed to deduct stock from Inventory Service: {}", e.getMessage());
-            Order cancelledOrder = Order.builder()
-                    .productId(request.getProductId())
-                    .quantity(request.getQuantity())
-                    .status("CANCELLED")
-                    .totalPrice(BigDecimal.ZERO)
-                    .build();
-            Order saved = orderRepository.save(cancelledOrder);
-            return OrderResponse.builder()
-                    .id(saved.getId())
-                    .productId(saved.getProductId())
-                    .quantity(saved.getQuantity())
-                    .status("CANCELLED")
-                    .totalPrice(BigDecimal.ZERO)
-                    .message("Stock deduction failed: " + e.getMessage())
-                    .build();
-        }
-
+        // 1. Tạo đơn hàng ban đầu với trạng thái PENDING
         Order order = Order.builder()
                 .productId(request.getProductId())
                 .quantity(request.getQuantity())
-                .status("COMPLETED")
-                .totalPrice(totalPrice)
+                .status("PENDING")
+                .totalPrice(BigDecimal.ZERO)
                 .build();
 
-        Order saved = orderRepository.save(order);
-        log.info("Order created successfully with id: {}, total_price: {}", saved.getId(), saved.getTotalPrice());
+        Order savedOrder = orderRepository.save(order);
+        log.info("==> [ORDER SERVICE] Created Order #{} with status PENDING", savedOrder.getId());
 
+        // 2. Tạo sự kiện OrderPlacedEvent
+        OrderPlacedEvent event = OrderPlacedEvent.builder()
+                .orderId(savedOrder.getId())
+                .productId(savedOrder.getProductId())
+                .quantity(savedOrder.getQuantity())
+                .timestamp(System.currentTimeMillis())
+                .build();
+
+        // 3. Gửi event vào Kafka topic 'order-events' bất đồng bộ
+        try {
+            orderKafkaTemplate.send(orderEventsTopic, String.valueOf(savedOrder.getId()), event);
+            log.info("==> [KAFKA PRODUCER] Published OrderPlacedEvent for orderId: {} to topic '{}'",
+                    savedOrder.getId(), orderEventsTopic);
+        } catch (Exception e) {
+            log.error("==> [KAFKA PRODUCER ERROR] Failed to publish order event to Kafka: {}", e.getMessage());
+        }
+
+        // 4. Trả về kết quả ngay lập tức cho client
         return OrderResponse.builder()
-                .id(saved.getId())
-                .productId(saved.getProductId())
-                .quantity(saved.getQuantity())
-                .status(saved.getStatus())
-                .totalPrice(saved.getTotalPrice())
-                .message("Order completed successfully")
+                .id(savedOrder.getId())
+                .productId(savedOrder.getProductId())
+                .quantity(savedOrder.getQuantity())
+                .status(savedOrder.getStatus())
+                .totalPrice(savedOrder.getTotalPrice())
+                .message("Order placed with status PENDING. Inventory verification and stock deduction in progress via Kafka.")
                 .build();
     }
 
@@ -177,4 +103,3 @@ public class OrderServiceImpl implements OrderService {
                 .build();
     }
 }
-
